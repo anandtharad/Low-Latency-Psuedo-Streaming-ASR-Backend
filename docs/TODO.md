@@ -280,7 +280,7 @@ Two costs if attempted:
 * **The frontend must match bit-for-bit.** A mismatch degrades accuracy with no
   error raised. Doing §3.2 first converts this from a hazard into a solved
   problem.
-* **265 tests and the diagnostic tooling would need rebuilding** — vocabulary
+* **321 tests and the diagnostic tooling would need rebuilding** — vocabulary
   extraction, alignment fidelity, the benchmark sweep. They exist because this
   pipeline has several silent-failure modes.
 
