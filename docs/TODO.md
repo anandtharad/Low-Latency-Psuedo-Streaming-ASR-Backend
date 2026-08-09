@@ -168,7 +168,25 @@ Still outstanding:
 * Re-run after §3.1 (batching) — that change is expected to move this curve more
   than anything else on the list.
 
-### 2.5.1 The service dies instead of shedding load — **defect**
+### 2.5.1 `ASR_INTRA_OP_THREADS=0` is the wrong default on CPU — **measured**
+
+ONNX Runtime's default (0 = use every core) makes each inference claim the whole
+machine, so concurrent streams fight each other. Measured on 4 physical cores,
+real checkpoint, response p50:
+
+| streams | default (0) | pinned to 2 |
+|---|---|---|
+| 1 | 1 329 ms | 1 577 ms |
+| 2 | 1 567 ms | 1 803 ms |
+| 4 | **6 133 ms** | **3 412 ms** |
+
+250 ms worse at one caller, 2.7 s better at four. The right default depends on
+whether the deployment is latency-per-caller or throughput, so it should stay
+configurable — but a CPU deployment that leaves it at 0 is silently choosing the
+worst option past one stream. At minimum, log a warning at startup when
+`intra_op_threads == 0` and `max_concurrent_streams > 1` on a CPU provider.
+
+### 2.5.2 The service dies instead of shedding load — **defect**
 
 At 16 concurrent streams the CUDA allocator failed inside a device-to-host copy
 and the **process went down**, taking every in-flight caller with it. The

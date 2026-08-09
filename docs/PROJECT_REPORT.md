@@ -608,6 +608,118 @@ and the number becomes queueing depth rather than responsiveness. The two modes
 are reported separately for that reason, and throughput-mode latency is never
 quoted as a user-facing figure.
 
+### 6.3 Where the response latency actually goes
+
+The decomposition holds at every concurrency level measured, on both devices:
+
+```
+response  =  segment_silence  +  segment processing  +  chunk granularity
+             (policy, 500 ms)     (queue + decode)       (+ socket, ~50-140 ms)
+```
+
+| | GTX 1650 | CPU, 4 cores |
+|---|---|---|
+| policy wait | 500 ms | 500 ms |
+| segment processing | **87 ms** | **780 ms** |
+| chunk granularity + socket | ~140 ms | ~50 ms |
+| **one caller, total** | **727 ms** | **1 329 ms** |
+
+Only the middle row is hardware. Two thirds of the single-caller latency on a
+GPU is policy and framing, which is worth knowing before anyone optimises the
+decoder to chase it.
+
+**It degrades in the right order.** Under load the rate limiter sheds partials
+while authoritative output stays complete:
+
+| streams (GPU) | partials/stream | segments/stream |
+|---|---|---|
+| 1 | 244 | **6** |
+| 4 | 152 | **6** |
+| 8 | 67 | **6** |
+
+Captions get choppier before the transcript loses anything. That was not
+designed in — it falls out of rate-limiting partials on measured cost — but it
+is the correct thing to shed, and it means a brief overload costs smoothness
+rather than words.
+
+### 6.4 CPU only — measured, and it works
+
+Same checkpoint, same recording, `ASR_PROVIDERS=CPUExecutionProvider`, on 4
+physical cores (Tiger Lake laptop):
+
+| streams | RTF p50 | response p50 | response p50, `INTRA_OP_THREADS=2` |
+|---|---|---|---|
+| 1 | 0.742 | 1 329 ms | 1 577 ms |
+| 2 | 0.863 | 1 567 ms | 1 803 ms |
+| 4 | 1.109 | **6 133 ms** | **3 412 ms** |
+
+Two findings.
+
+**ONNX Runtime's default threading is self-defeating under concurrency.** With
+`intra_op_threads = 0` (the library default, and this project's default) every
+inference claims every core, so four streams put roughly sixteen threads on
+eight logical cores. Pinning to 2 costs 250 ms at one caller and saves 2.7 s at
+four. **Any CPU deployment must set `ASR_INTRA_OP_THREADS` explicitly**; 0 is
+the wrong default there, and this is the cheapest tuning win in the project.
+
+**A 4-core laptop CPU is within 2× of a GTX 1650 on RTF** — 0.74 against 0.43.
+That says more about the GTX 1650 than about the CPU, but it does mean CPU-only
+is a real option rather than a fallback. Usable concurrency is **1–2 streams per
+4 physical cores**, roughly 2 cores per stream.
+
+CPU-only is also where the torch-free runtime finally earns its keep: no CUDA,
+no torch, 68 MB instead of 425 MB — once `TODO.md` §1.3 is fixed, at which point
+nothing about the CUDA-DLL side effect matters any more either.
+
+### 6.5 What transfers to other hardware — **estimates**
+
+Everything in this subsection is extrapolation and is labelled as such. The
+measured parts are §6.2–6.4.
+
+GPU utilisation fits **≈ 15 % baseline + 12 % per stream** (27 / 38 / 64 / 91 %
+at 1 / 2 / 4 / 8 streams). Two thresholds follow:
+
+* compute saturation at **N ≈ 7**, where the fit crosses 100 %;
+* the latency knee at **N ≈ 4**, at 64 % utilisation.
+
+**Usable concurrency is ~55–60 % of the saturation point, not the saturation
+point.** That ratio is the thing worth carrying to other hardware. The absolute
+numbers are not.
+
+Memory ran out at nearly the same concurrency here — ~1.7 GB resident plus
+~250–400 MB per stream against 4 GB — but that is a coincidence of a small card.
+On 24 GB, memory stops binding entirely and compute binds alone.
+
+Scaling the per-stream cost by FP32 throughput. Weight traffic is ~2.6 GB/s per
+stream against 128 GB/s available, so this workload is compute-bound rather than
+bandwidth-bound, which makes FLOPS the right lever — discounted for the poorer
+occupancy a small-batch model gets on a large die:
+
+| | usable streams | basis |
+|---|---|---|
+| GTX 1650, 4 GB | **4** | **measured** |
+| T4, 16 GB | ~10–12 | *est.*, 2.8× FP32 |
+| L4 / A10G, 24 GB | ~20–40 | *est.*, 10× FP32, discounted 50–100 % |
+| 32-core server CPU | ~8–12 | *est.*, sublinear scaling, lower clocks, needs thread pinning |
+
+Two multipliers compound on top of any of these, and both matter more than the
+choice of card: **batching** streams into one inference call (§8.1, *est.*
+3–4×) and **INT8** (*est.* 2–3× on x86 with VNNI, more with AMX).
+
+### 6.6 What no hardware fixes
+
+* **The 500 ms policy floor.** Lower `ASR_SEGMENT_SILENCE` if you want a faster
+  answer; that trades against false cuts, and no GPU affects it.
+* **The ~210 s structural limit** (§2.3). The model's own relative-position
+  buffer. An A100 hits it at the same place.
+* **The ~1 % Python glue.** Already measured; nothing to reclaim.
+
+The one number to carry to a new machine is not a concurrency figure — it is the
+**utilisation-to-latency relationship**. Keep the device under ~65 % and callers
+see ~1.2 s; let it reach 90 % and they see 3.4 s *while RTF still reads 0.9 and
+looks healthy*. Set `ASR_MAX_CONCURRENT_STREAMS` from that, measured on the real
+box.
+
 ---
 
 ## 7. Current limitations

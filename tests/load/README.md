@@ -170,6 +170,19 @@ The sweep does **not** stop at the first bad level unless you pass
 or admitting everyone and making them all late — is worth knowing before it
 happens for real.
 
+### On CPU, pin the thread count first
+
+ONNX Runtime defaults to using every core for a single inference, so concurrent
+streams fight each other. Measured on 4 physical cores, response p50:
+
+| streams | `ASR_INTRA_OP_THREADS=0` (default) | `=2` |
+|---|---|---|
+| 1 | 1 329 ms | 1 577 ms |
+| 4 | **6 133 ms** | **3 412 ms** |
+
+Sweep with it set. A CPU sweep at the default measures thread contention more
+than it measures the service.
+
 ### Reading the curve
 
 * **Latency climbs, GPU utilisation is pinned near 100%** — the device is the
