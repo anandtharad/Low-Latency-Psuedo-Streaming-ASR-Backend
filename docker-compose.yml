@@ -1,0 +1,69 @@
+# Single-command deployment.
+#
+#   cp .env.example .env      # point it at your model and LM
+#   docker compose up asr     # CPU
+#   docker compose --profile gpu up asr-gpu
+#
+# Model assets are mounted read-only rather than baked into the image: the same
+# image then serves any checkpoint, and no image layer carries model or
+# patient-adjacent data.
+
+services:
+  asr:
+    build:
+      context: .
+      target: cpu
+    image: streaming-asr:cpu
+    ports:
+      - "${ASR_PORT:-8000}:8000"
+    volumes:
+      # Left side is the host path, right side is what ASR_* variables must use.
+      - ${ASR_ASSETS_DIR:-/data/asr}:/data/asr:ro
+    environment:
+      ASR_MODEL_PATH: ${ASR_MODEL_PATH:?set ASR_MODEL_PATH in .env}
+      ASR_LM_PATH: ${ASR_LM_PATH:-}
+      ASR_LEXICON_PATH: ${ASR_LEXICON_PATH:-}
+      ASR_VOCAB_PATH: ${ASR_VOCAB_PATH:-}
+      ASR_DEVICE: cpu
+      ASR_CHUNK_MS: ${ASR_CHUNK_MS:-160}
+      ASR_CONTEXT_SEC: ${ASR_CONTEXT_SEC:-3.84}
+      ASR_STABILITY_WINDOW: ${ASR_STABILITY_WINDOW:-0.6}
+      ASR_MIN_STABLE_UPDATES: ${ASR_MIN_STABLE_UPDATES:-2}
+      ASR_ALIGNER: ${ASR_ALIGNER:-time}
+      ASR_MAX_CONCURRENT_STREAMS: ${ASR_MAX_CONCURRENT_STREAMS:-4}
+      ASR_LOG_LEVEL: ${ASR_LOG_LEVEL:-info}
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  asr-gpu:
+    profiles: ["gpu"]
+    build:
+      context: .
+      # Switch to gpu-kenlm if you are using --lm; it compiles flashlight+KenLM.
+      target: gpu
+    image: streaming-asr:gpu
+    ports:
+      - "${ASR_PORT:-8000}:8000"
+    volumes:
+      - ${ASR_ASSETS_DIR:-/data/asr}:/data/asr:ro
+    environment:
+      ASR_MODEL_PATH: ${ASR_MODEL_PATH:?set ASR_MODEL_PATH in .env}
+      ASR_LM_PATH: ${ASR_LM_PATH:-}
+      ASR_LEXICON_PATH: ${ASR_LEXICON_PATH:-}
+      ASR_VOCAB_PATH: ${ASR_VOCAB_PATH:-}
+      # Fails fast if CUDA did not come up, instead of silently serving from
+      # CPU at a fraction of the throughput.
+      ASR_DEVICE: cuda
+      ASR_CHUNK_MS: ${ASR_CHUNK_MS:-160}
+      ASR_CONTEXT_SEC: ${ASR_CONTEXT_SEC:-3.84}
+      ASR_MAX_CONCURRENT_STREAMS: ${ASR_MAX_CONCURRENT_STREAMS:-8}
+      ASR_LOG_LEVEL: ${ASR_LOG_LEVEL:-info}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    stop_grace_period: 30s

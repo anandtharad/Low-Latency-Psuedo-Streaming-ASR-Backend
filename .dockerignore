@@ -1,0 +1,25 @@
+# Keep the build context small and free of anything model- or data-shaped.
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Assets are mounted at run time, never baked into an image.
+fixtures/
+*.onnx
+*.nemo
+*.wav
+*.bin
+*.lexicon
+
+# Local config may contain host paths and secrets.
+.env
+
+# Not needed to run the service.
+tests/
+docs/
+examples/
+benchmark_results.json
+*.ipynb
+*.log

@@ -1,0 +1,60 @@
+# What belongs in this repository: source, configuration, documentation and
+# the scripts that regenerate everything else. Models, corpora and benchmark
+# output are all reproducible from those and are excluded.
+
+# --- environments and caches ----------------------------------------------
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# --- models and model assets ----------------------------------------------
+# Half a gigabyte each, and licensed separately from this code. Mount them at
+# run time (see .env.example) or rebuild the fixtures with tools/.
+*.onnx
+*.nemo
+*.pt
+*.pth
+*.bin
+*.lexicon
+*.arpa
+
+# --- audio and corpora -----------------------------------------------------
+# Common Voice is ~1 GB here and redistributable only under its own terms.
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+*.webm
+common_voice_en/
+
+# --- generated output ------------------------------------------------------
+# Benchmark results are measurements of one machine; regenerate with
+# tools/real_audio_wer.py and tests/load/. The figures that matter are quoted
+# in docs/ with the conditions they were taken under.
+results/
+benchmark_results.json
+*.log
+*.jsonl
+
+# --- local configuration ---------------------------------------------------
+# May contain host paths and credentials. .env.example is committed instead.
+.env
+.claude/settings.local.json
+
+# --- editors and operating systems ----------------------------------------
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# The checkpoint's token table: model-derived data. Regenerate it with
+# tools/extract_vocabulary.py --nemo model.nemo --out vocab.txt --verify model.onnx
+vocab.txt

@@ -1,0 +1,37 @@
+# Core runtime
+numpy>=1.24
+torch>=2.1
+torchaudio>=2.1
+soundfile>=0.12
+
+# --- ONNX Runtime: pick exactly ONE of these two ---------------------------
+# CPU only:
+onnxruntime>=1.16
+# GPU: replace the line above with onnxruntime-gpu, and MATCH ITS CUDA MAJOR
+# VERSION TO YOUR TORCH BUILD. onnxruntime-gpu does not ship the CUDA runtime;
+# it loads cublas/cudnn from the DLL search path, which a pip-installed CUDA
+# torch provides. A mismatch does NOT raise -- get_available_providers() still
+# lists CUDAExecutionProvider, the session silently falls back to CPU, and you
+# lose the GPU without being told.
+#   verified here: torch 2.5.1+cu121 + onnxruntime-gpu==1.20.2  -> works
+#                  torch 2.5.1+cu121 + onnxruntime-gpu==1.28.0  -> needs CUDA 13, fails
+# onnxruntime-gpu==1.20.2
+
+# Live microphone capture (--mic). Needs libportaudio2 on Linux.
+# sounddevice>=0.4
+
+# GPU utilisation / memory in the metrics output
+# pynvml
+
+# Final beam + KenLM decoding (primary backend, matches the reference).
+# flashlight-text has no Windows wheel; on Windows the pipeline falls back to
+# the LM-free pure-Python beam decoder and says so loudly.
+# flashlight-text>=0.0.4
+# kenlm
+
+# Alternative LM backend, also used in the reference notebook
+# pyctcdecode>=0.5.0
+
+# Development
+pytest>=7.4
+onnx>=1.15                 # only needed to build the synthetic fixture

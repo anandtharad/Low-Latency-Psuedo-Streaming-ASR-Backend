@@ -1,0 +1,12 @@
+# Service dependencies.
+#
+# torch / torchaudio / onnxruntime are NOT listed here: the Dockerfile installs
+# the CPU or CUDA build per target, and pinning them here would fight that.
+
+numpy>=1.24
+soundfile>=0.12
+
+fastapi>=0.110
+uvicorn[standard]>=0.27
+websockets>=12.0
+python-multipart>=0.0.9
