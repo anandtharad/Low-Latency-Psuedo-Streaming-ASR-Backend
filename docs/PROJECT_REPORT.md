@@ -689,11 +689,24 @@ physical cores (Tiger Lake laptop):
 Two findings.
 
 **ONNX Runtime's default threading is self-defeating under concurrency.** With
-`intra_op_threads = 0` (the library default, and this project's default) every
-inference claims every core, so four streams put roughly sixteen threads on
-eight logical cores. Pinning to 2 costs 250 ms at one caller and saves 2.7 s at
-four. **Any CPU deployment must set `ASR_INTRA_OP_THREADS` explicitly**; 0 is
-the wrong default there, and this is the cheapest tuning win in the project.
+`intra_op_threads = 0` every inference claims every core, so four streams put
+roughly sixteen threads on eight logical cores.
+
+The thread count is now derived from the admission cap rather than left at that
+default (`streaming_asr_lite/execution.py`). Re-measured with the derivation in
+place — it selected 2 threads, logging `8 logical cores / 4 streams`:
+
+| streams | ORT default | pinned to 2 by hand | **derived** |
+|---|---|---|---|
+| 1 | 1 329 ms | 1 577 ms | **1 241 ms** |
+| 2 | 1 567 ms | 1 803 ms | 1 683 ms |
+| 4 | **6 133 ms** | 3 412 ms | **2 596 ms** |
+
+The four-stream improvement is the real result. The rest is inside run-to-run
+variance: the derived run picked the same thread count as the hand-pinned one
+at N=1 and came out 336 ms faster, which is noise from background load rather
+than a difference the setting could have caused. **Only the 6 133 → 2 596 ms
+change is large enough to trust.**
 
 **A 4-core laptop CPU is within 2× of a GTX 1650 on RTF** — 0.74 against 0.43.
 That says more about the GTX 1650 than about the CPU, but it does mean CPU-only
@@ -739,7 +752,85 @@ Two multipliers compound on top of any of these, and both matter more than the
 choice of card: **batching** streams into one inference call (§8.1, *est.*
 3–4×) and **INT8** (*est.* 2–3× on x86 with VNNI, more with AMX).
 
-### 6.6 What no hardware fixes
+### 6.6 Cost as a function of how long someone talks
+
+One recording per duration bin, single stream, real checkpoint, compute measured
+directly rather than inferred from wall clock
+([`tools/profile_by_duration.py`](../tools/profile_by_duration.py)). Bins to
+~10 s are real Common Voice clips; the corpus has nothing longer, so the rest
+are consecutive clips from one speaker joined by 0.7 s pauses.
+
+**`rtf_speech` is compute per second of speech — the model's actual cost.
+`rtf_audio` divides by total audio including silence, and is the capacity
+figure.** Reporting only the second one credits the model for time it spent
+waiting.
+
+| bin | audio | speech | silence | seg | GPU `rtf_s` | GPU `rtf_a` | CPU `rtf_s` | CPU `rtf_a` |
+|---|---|---|---|---|---|---|---|---|
+| 5 s | 3.4 s | 2.8 s | 0.6 s | 1 | 0.438 | 0.357 | 0.674 | 0.549 |
+| 10 s | 6.8 s | 6.6 s | 0.3 s | 1 | 0.323 | 0.310 | 0.779 | 0.747 |
+| 15 s | 10.3 s | 10.1 s | 0.2 s | 1 | 0.360 | 0.353 | 0.763 | 0.750 |
+| 20 s | 22.8 s | 19.6 s | 3.2 s | 3 | 0.336 | 0.289 | 0.769 | 0.662 |
+| 30 s | 30.7 s | 25.6 s | 5.1 s | 5 | 0.329 | 0.275 | 0.778 | 0.649 |
+| 45 s | 42.9 s | 35.5 s | 7.4 s | 7 | 0.363 | 0.300 | 0.871 | 0.720 |
+| 60 s | 57.7 s | 47.0 s | 10.8 s | 10 | 0.342 | 0.278 | 0.898 | 0.730 |
+| 90 s | 82.5 s | 64.2 s | 18.2 s | 14 | 0.338 | 0.263 | 0.998 | 0.777 |
+| 120 s | 105.9 s | 86.6 s | 19.4 s | 17 | 0.385 | 0.315 | **1.008** | 0.823 |
+
+**On GPU the cost is flat — 0.33 ± 0.04 from 3 seconds of audio to 106.** That is
+the segmentation design working exactly as claimed: every forward pass is the
+same size no matter how long the speaker goes on, so a two-minute turn costs
+proportionally what a three-second one does. Compare §2.2, where single-pass
+*accuracy* degrades over the same range; here it is the *cost* that stays put.
+
+**On CPU it is not flat.** It climbs from 0.77 at 15 s to 1.008 at 120 s, and
+crossing 1.0 means a four-core laptop cannot keep up with real time on a long
+turn even with nobody else connected. The segment work is identical, so this is
+almost certainly thermal throttling — a laptop sustaining 75 s of full-tilt
+inference downclocks — but that is a hypothesis, not a measurement. **Worth
+confirming on a properly cooled server CPU before treating the long-turn CPU
+numbers as a property of the software.**
+
+Silence is 18–25 % of a constructed turn, which is why the two RTFs diverge as
+turns get longer. Real conversational audio has more.
+
+### 6.7 What the beam decoder costs, and where
+
+The segmented pipeline has **no separate final decode**. Each segment is decoded
+authoritatively as it closes, so choosing a beam does not add one step at the
+end of a turn — it adds cost to *every pause*. `final_decode_time` is
+structurally zero here, which is why it is not the figure to look at.
+
+Per-segment decode time, same runs:
+
+| bin | seg | GPU greedy | GPU beam | CPU greedy | CPU beam |
+|---|---|---|---|---|---|
+| 15 s | 1 | 75 ms | 2 302 ms | 521 ms | 2 763 ms |
+| 30 s | 5 | 59 ms | 1 390 ms | 327 ms | 1 581 ms |
+| 60 s | 10 | 57 ms | 1 292 ms | 434 ms | 3 020 ms |
+| 120 s | 17 | 72 ms | 1 522 ms | 676 ms | 3 368 ms |
+
+Greedy is flat and cheap — ~60 ms per segment on GPU regardless of turn length,
+for the same reason the RTF is flat. **The beam is 20–25× that**, and a caller
+pays it after every pause, on top of the 500 ms silence wait. On these numbers
+the beam would take the single-caller response latency from ~730 ms to ~2 s.
+
+Two caveats, and they point in opposite directions:
+
+* **This is not the cost of beam search, it is the cost of beam search in
+  Python.** The default `pure_python` backend is a reference implementation.
+  Flashlight would be far faster and has never run here.
+* **This is beam search *without* an LM**, which is the cheap half. `beam_lm`
+  needs `--lm` and `--lexicon`; there is no Windows wheel for `flashlight-text`,
+  so that path has never executed anywhere in this project (§7). Whatever it
+  costs, it costs more than this column.
+
+So the honest statement is: **the LM-free Python beam is unusable in the live
+path at ~1.3 s per segment, and the configuration that would actually be shipped
+has never been measured at all.** `ASR_FINAL_BEAM=false` is the default for this
+reason, and every benchmark above ran greedy.
+
+### 6.8 What no hardware fixes
 
 * **The 500 ms policy floor.** Lower `ASR_SEGMENT_SILENCE` if you want a faster
   answer; that trades against false cuts, and no GPU affects it.
