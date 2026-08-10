@@ -21,6 +21,10 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 
+# Leaf module: imports nothing from either package, so this does not create a
+# cycle with streaming_asr_lite.engine, which imports from here.
+from streaming_asr_lite.execution import ensure_cuda_libraries, resolve_intra_op_threads
+
 logger = logging.getLogger(__name__)
 
 #: Substrings that would indicate a stateful / cached streaming export.
@@ -30,21 +34,28 @@ _STATEFUL_HINTS = (
 
 
 def _preload_cuda_runtime() -> None:
-    """Import torch before onnxruntime so ORT can find the CUDA libraries.
+    """Make ORT able to find the CUDA libraries before the session is built.
 
     On Windows this is the difference between a working GPU session and a
     silent fall back to CPU. ``onnxruntime-gpu`` does not ship the CUDA runtime;
     it loads ``cublas``/``cudnn`` from the DLL search path. A pip-installed
-    CUDA build of torch does ship them, and registers its ``torch/lib``
-    directory when imported -- but only if it is imported *first*.
+    CUDA build of torch does ship them, in ``torch/lib``.
 
-    Verified on this machine: with torch imported first the session reports
+    This used to be ``import torch`` -- the directory gets registered as a side
+    effect. :func:`ensure_cuda_libraries` registers the same directory without
+    executing the module, which is both cheaper here and usable from the
+    torch-free runtime. The torch import is kept only as a fallback for layouts
+    where the spec cannot be resolved but an import would still work.
+
+    Verified on this machine: with the directory registered the session reports
     ``['CUDAExecutionProvider', 'CPUExecutionProvider']``; without it, the same
     call reports ``['CPUExecutionProvider']`` and gives no error, only a log
     line about a missing DLL.
 
     Harmless when torch is absent or CPU-only.
     """
+    if ensure_cuda_libraries():
+        return
     try:
         import torch  # noqa: F401
     except Exception:
@@ -130,7 +141,10 @@ class ONNXASREngine:
         model_path: Path to the exported ``.onnx`` file.
         providers: ``"auto"`` prefers CUDA and falls back to CPU; otherwise an
             explicit list of ONNX Runtime provider names.
-        intra_op_threads: 0 leaves the ORT default.
+        intra_op_threads: 0 derives a value; see
+            :func:`~streaming_asr_lite.execution.resolve_intra_op_threads`.
+        max_concurrent_streams: How many streams may run against this session
+            at once. Only used to derive the thread count.
     """
 
     def __init__(
@@ -139,6 +153,7 @@ class ONNXASREngine:
         providers: str | Sequence[str] = "auto",
         intra_op_threads: int = 0,
         device_id: int = 0,
+        max_concurrent_streams: int = 1,
     ) -> None:
         _preload_cuda_runtime()
         import onnxruntime as ort
@@ -148,10 +163,15 @@ class ONNXASREngine:
 
         sess_options = ort.SessionOptions()
         sess_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        if intra_op_threads > 0:
-            sess_options.intra_op_num_threads = intra_op_threads
 
         resolved = self._resolve_providers(providers)
+        threads, reason = resolve_intra_op_threads(
+            intra_op_threads, resolved, max_concurrent_streams
+        )
+        if threads > 0:
+            sess_options.intra_op_num_threads = threads
+            logger.info("intra_op_threads=%d (%s)", threads, reason)
+
         logger.info("Loading ONNX model %s with providers=%s", model_path, resolved)
         self.session = ort.InferenceSession(
             model_path, sess_options=sess_options, providers=resolved

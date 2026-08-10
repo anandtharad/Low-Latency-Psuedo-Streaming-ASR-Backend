@@ -52,53 +52,20 @@ Related and quieter: the first OOM permanently disables zero-copy `io_binding`
 for the rest of the process, so one oversized decode leaves the service slower
 for every request after it.
 
-### 1.3 The server loads torch whatever `ASR_RUNTIME` says — **live defect**
-
-`streaming_asr/server/model_pool.py` line 43:
-
-```python
-from streaming_asr.pipeline import StreamingASRPipeline
-```
-
-Unused since `new_pipeline()` started delegating to
-`streaming_asr_lite.factory.build_pipeline`. It still executes, pulling in the
-torch preprocessor. `streaming_asr/cli.py` does the equivalent.
-
-Two consequences, in opposite directions:
-
-* **The lite runtime's footprint benefit is not realised by the service.** The
-  68 MB / 0.28 s figures are for a process importing only
-  `streaming_asr_lite.*`, which is what `tests/test_lite.py` verifies. The
-  server is the 425 MB number regardless of `ASR_RUNTIME`.
-* **…but on Windows that accident is what gives the server CUDA at all.**
-  Importing torch first puts the CUDA/cuDNN DLLs where ONNX Runtime can find
-  them. Measured on this machine: lite runtime standalone →
-  `CPUExecutionProvider`; lite runtime under the server → `CUDAExecutionProvider`.
-
-So deleting the dead import is correct *and* would cost this machine its GPU.
-Do both together: remove the import **and** install the CUDA runtime properly
-(or deploy the container, which already has it). Add a test asserting the server
-process does not import torch under `ASR_RUNTIME=lite` — it will fail today,
-which is the point.
-
-Found by the benchmark metadata in `tests/load/`, which records active providers
-per run; the discrepancy showed up as the same configuration reporting different
-providers from two entry points.
-
-### 1.4 Backlog chunks pollute latency metrics
+### 1.3 Backlog chunks pollute latency metrics
 
 `AudioChunk.capture_time` feeds `update_latency`. A flushed ring-buffer backlog
 arrives faster than real time, so the first turn of every session will report an
 inflated latency that never happened. Flag backlog chunks and exclude them.
 
-### 1.5 The flashlight + KenLM path has never executed
+### 1.4 The flashlight + KenLM path has never executed
 
 No Windows wheel for `flashlight-text`, so the reference decoder is written but
 completely untested at runtime. Everything to date has run on the LM-free
 `pure_python` backend. **Exercise it on Linux before trusting any final-decode
 quality number.**
 
-### 1.6 Merge-across-boundary duplicates (windowed pipeline only)
+### 1.5 Merge-across-boundary duplicates (windowed pipeline only)
 
 If the model merges a committed word with the next one (`"is"` + `"closed"` →
 `"isclosed"` after `"is"` is committed), a short duplicate results. Accepted
@@ -168,25 +135,7 @@ Still outstanding:
 * Re-run after §3.1 (batching) — that change is expected to move this curve more
   than anything else on the list.
 
-### 2.5.1 `ASR_INTRA_OP_THREADS=0` is the wrong default on CPU — **measured**
-
-ONNX Runtime's default (0 = use every core) makes each inference claim the whole
-machine, so concurrent streams fight each other. Measured on 4 physical cores,
-real checkpoint, response p50:
-
-| streams | default (0) | pinned to 2 |
-|---|---|---|
-| 1 | 1 329 ms | 1 577 ms |
-| 2 | 1 567 ms | 1 803 ms |
-| 4 | **6 133 ms** | **3 412 ms** |
-
-250 ms worse at one caller, 2.7 s better at four. The right default depends on
-whether the deployment is latency-per-caller or throughput, so it should stay
-configurable — but a CPU deployment that leaves it at 0 is silently choosing the
-worst option past one stream. At minimum, log a warning at startup when
-`intra_op_threads == 0` and `max_concurrent_streams > 1` on a CPU provider.
-
-### 2.5.2 The service dies instead of shedding load — **defect**
+### 2.5.1 The service dies instead of shedding load — **defect**
 
 At 16 concurrent streams the CUDA allocator failed inside a device-to-host copy
 and the **process went down**, taking every in-flight caller with it. The

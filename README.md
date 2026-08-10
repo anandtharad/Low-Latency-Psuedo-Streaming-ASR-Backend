@@ -126,12 +126,11 @@ python -m streaming_asr_lite.export_frontend --out fixtures/frontend.onnx
 
 `streaming_asr/` is unmodified and remains the reference and fallback.
 
-> **The service does not yet get this benefit.** Those figures are for a process
-> importing only `streaming_asr_lite.*`. `server/model_pool.py` still carries a
-> dead `from streaming_asr.pipeline import StreamingASRPipeline`, which pulls
-> torch in regardless of `ASR_RUNTIME` — and, on Windows, is the only reason
-> ONNX Runtime finds the CUDA DLLs at all. Both sides of that are in
-> [`docs/TODO.md`](docs/TODO.md) §1.3.
+The service gets this too: `tests/test_execution.py` imports the server, the app
+and the CLI in clean interpreters and fails if torch appears in any of them. On
+Windows the CUDA libraries are still taken from `torch/lib` when that is the only
+copy on the machine — located with `find_spec` and loaded with `ctypes`, without
+importing torch. See [`PROJECT_REPORT.md` §5.4](docs/PROJECT_REPORT.md).
 
 Two design notes for the wider system (**not implemented**):
 

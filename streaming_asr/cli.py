@@ -16,6 +16,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from streaming_asr.audio.wav_source import WavFileSource
 from streaming_asr.config import (
@@ -28,8 +29,13 @@ from streaming_asr.config import (
 )
 from streaming_asr.console import configure_logging, configure_stdout
 from streaming_asr.events import ASREvent, ASREventType
-from streaming_asr.pipeline import StreamingASRPipeline
 from streaming_asr.trace import HypothesisTracer
+
+if TYPE_CHECKING:
+    # Annotation-only. Importing it for real would pull in the torch
+    # preprocessor and make `--runtime lite` torch-dependent at the CLI, which
+    # is the whole thing that runtime exists to avoid.
+    from streaming_asr.pipeline import StreamingASRPipeline
 
 
 def build_parser() -> argparse.ArgumentParser:

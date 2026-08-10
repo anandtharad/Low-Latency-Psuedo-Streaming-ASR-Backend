@@ -1,11 +1,14 @@
 """ONNX Runtime engine without the torch CUDA preload.
 
 Why not reuse :class:`streaming_asr.inference.ONNXASREngine`? Its constructor
-calls ``_preload_cuda_runtime()``, which imports torch so that ONNX Runtime can
-find ``cublas``/``cudnn`` from ``torch/lib`` on Windows. That is correct for the
-main package and pointless here: a runtime built to avoid torch cannot rely on
-torch to supply its CUDA libraries. It must get them from the CUDA toolkit or
-the container image.
+used to import torch outright so that ONNX Runtime could find ``cublas`` and
+``cudnn`` from ``torch/lib`` on Windows -- correct for the main package, and
+self-defeating for a runtime that exists to remove torch.
+
+Both now call :func:`streaming_asr_lite.execution.ensure_cuda_libraries`, which
+registers that same directory **without importing the module**. So this engine
+gets CUDA where it is available, at no import cost, and stops depending on the
+CUDA toolkit or the container image being right.
 
 Everything torch-free is reused -- the report dataclasses, the stateless-graph
 detection, the subsampling-factor logic all come from the main package. Only
@@ -27,6 +30,7 @@ from streaming_asr.inference.onnx_engine import (
     ModelGraphReport,
     TensorSpec,
 )
+from streaming_asr_lite.execution import ensure_cuda_libraries, resolve_intra_op_threads
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +43,9 @@ class LiteONNXEngine:
         model_path: str,
         providers: str | Sequence[str] = "auto",
         intra_op_threads: int = 0,
+        max_concurrent_streams: int = 1,
     ) -> None:
+        ensure_cuda_libraries()
         import onnxruntime as ort
 
         self.model_path = model_path
@@ -47,10 +53,15 @@ class LiteONNXEngine:
 
         options = ort.SessionOptions()
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        if intra_op_threads > 0:
-            options.intra_op_num_threads = intra_op_threads
 
         resolved = self._resolve_providers(providers)
+        threads, reason = resolve_intra_op_threads(
+            intra_op_threads, resolved, max_concurrent_streams
+        )
+        if threads > 0:
+            options.intra_op_num_threads = threads
+            logger.info("intra_op_threads=%d (%s)", threads, reason)
+
         logger.info("Loading ONNX model %s with providers=%s", model_path, resolved)
         self.session = ort.InferenceSession(
             model_path, sess_options=options, providers=resolved

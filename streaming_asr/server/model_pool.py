@@ -40,7 +40,6 @@ from streaming_asr.decoding.beam_ctc_lm import (
 )
 from streaming_asr.device import gpu_name, resolve_device
 from streaming_asr.inference.onnx_engine import ONNXASREngine
-from streaming_asr.pipeline import StreamingASRPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -96,13 +95,21 @@ class ModelPool:
         if config.runtime == "lite":
             # No torch device to place: the frontend is an ONNX graph running on
             # the encoder's providers. Calling resolve_device() here would import
-            # torch and defeat the point of this runtime.
+            # torch and defeat the point of this runtime -- as would importing
+            # anything from streaming_asr.pipeline at module scope, which is how
+            # this module spent a while quietly loading torch anyway.
             self.placement = None
-            self.engine = build_engine(config)
+            self.engine = build_engine(
+                config, max_concurrent_streams=max_concurrent_streams
+            )
         else:
             self.placement = resolve_device(config.device, config.providers)
             logger.info("Placement: %s", self.placement.describe())
-            self.engine = build_engine(config, providers=self.placement.providers)
+            self.engine = build_engine(
+                config,
+                providers=self.placement.providers,
+                max_concurrent_streams=max_concurrent_streams,
+            )
 
         logger.info("Runtime: %s", describe_runtime(config, self.engine))
 

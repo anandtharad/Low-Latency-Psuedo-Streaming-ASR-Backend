@@ -309,7 +309,12 @@ class StreamingASRConfig:
     device: str = "auto"
     #: "auto" derives providers from ``device``; an explicit list overrides it.
     providers: str = "auto"
-    #: ONNX Runtime intra-op thread count. 0 = library default.
+    #: ONNX Runtime intra-op thread count. 0 = derive one; see
+    #: ``streaming_asr_lite.execution.resolve_intra_op_threads``. ORT's own
+    #: default is every core *per inference*, which is right for one stream and
+    #: costly for several: measured on 4 physical cores, response p50 at 4
+    #: concurrent streams was 6133 ms at the ORT default against 3412 ms pinned
+    #: to 2. A positive value here is always used as given.
     intra_op_threads: int = 0
 
     # ---- sub-configs ----------------------------------------------------

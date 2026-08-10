@@ -33,12 +33,20 @@ def resolve_frontend_path(config: StreamingASRConfig) -> Path:
     return path
 
 
-def build_engine(config: StreamingASRConfig, providers: Any = None) -> Any:
+def build_engine(
+    config: StreamingASRConfig,
+    providers: Any = None,
+    max_concurrent_streams: int = 1,
+) -> Any:
     """Engine for the configured runtime.
 
-    The lite path must not use :class:`ONNXASREngine`: its constructor imports
-    torch so ONNX Runtime can find CUDA libraries from ``torch/lib`` on Windows,
-    which would restore the dependency this runtime exists to remove.
+    The lite path must not use :class:`ONNXASREngine`: that class belongs to the
+    torch-dependent package, and importing it here would pull the torch
+    preprocessor in behind it.
+
+    ``max_concurrent_streams`` only feeds the intra-op thread count. A server
+    must pass its real admission cap or every stream will be sized as though it
+    had the machine to itself.
     """
     if config.runtime == "lite":
         from streaming_asr_lite.engine import LiteONNXEngine
@@ -47,6 +55,7 @@ def build_engine(config: StreamingASRConfig, providers: Any = None) -> Any:
             model_path=config.onnx_model_path,
             providers=providers if providers is not None else config.providers,
             intra_op_threads=config.intra_op_threads,
+            max_concurrent_streams=max_concurrent_streams,
         )
 
     from streaming_asr.inference.onnx_engine import ONNXASREngine
@@ -55,6 +64,7 @@ def build_engine(config: StreamingASRConfig, providers: Any = None) -> Any:
         model_path=config.onnx_model_path,
         providers=providers if providers is not None else config.providers,
         intra_op_threads=config.intra_op_threads,
+        max_concurrent_streams=max_concurrent_streams,
     )
 
 

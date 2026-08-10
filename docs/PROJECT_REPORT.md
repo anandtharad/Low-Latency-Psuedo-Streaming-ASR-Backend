@@ -421,22 +421,55 @@ DLLs. So the lite runtime is fast on the server *by accident*, and would silentl
 lose its GPU the moment someone deleted an unused import. `streaming_asr/cli.py`
 pulls torch the same way.
 
-Two things follow, and the second is the more embarrassing:
+Two things followed, and the second was the more embarrassing:
 
-* **CUDA availability rests on an import side effect.** Nothing lies about it —
+* **CUDA availability rested on an import side effect.** Nothing lied about it —
   `/health` reports the providers that actually loaded — but "delete an unused
   import, lose the GPU" is not a property anyone chose.
-* **The service does not realise the torch-free footprint at all.** The 68 MB /
+* **The service did not realise the torch-free footprint at all.** The 68 MB /
   0.28 s figures elsewhere in this document are for the runtime *in isolation*,
-  which is what `tests/test_lite.py` asserts. The server loads torch regardless
-  of `ASR_RUNTIME`, so its RSS is the 425 MB number. That claim was made for the
-  package and quietly read as a claim about the service.
+  which is what `tests/test_lite.py` asserts. The server loaded torch regardless
+  of `ASR_RUNTIME`. That claim was made for the package and quietly read as a
+  claim about the service.
 
-Neither is fixed here, because the fix is a real decision rather than a
-one-line deletion: removing the import is correct and would cost this machine
-its GPU until CUDA is installed properly (or the container is used). Recorded in
-[`TODO.md` §1.3](TODO.md). Every results file records the *active* providers for
-exactly this reason, and the run header warns when a GPU is present but unused.
+**Both are now fixed**, and the fix is more useful than the deletion would have
+been. The trap was that removing the dead import is *correct* and would have
+cost this machine its GPU — so the two had to be separated rather than traded
+off.
+
+`importlib.util.find_spec("torch")` locates `torch/lib` **without executing the
+module**, so the CUDA libraries can be found without paying for torch.
+Registering the directory turned out to be necessary but not sufficient: ONNX
+Runtime resolves those DLLs as ordinary dependencies of its own provider DLL,
+which goes through the standard loader search order and ignores
+`os.add_dll_directory`. Measured — with only the directory registered, the
+session still came up `CPUExecutionProvider`. What `import torch` was actually
+doing was *loading* them, so the loader satisfies later requests for the same
+name from memory. `ctypes.WinDLL` on each library, in dependency order, does the
+same thing deliberately.
+
+The result, measured on a running server with `ASR_RUNTIME=lite`:
+
+```
+runtime   : lite
+providers : ['CUDAExecutionProvider', 'CPUExecutionProvider']
+torch runtime DLLs mapped : NONE      (torch_python / torch_cpu / c10)
+CUDA DLLs mapped          : cudart64_12, cublas64_12, cudnn64_9, +5 cuDNN 9 parts
+```
+
+CUDA, no torch. `streaming_asr/cli.py` had the same defect, where the import was
+annotation-only and `TYPE_CHECKING` was enough. Four tests in
+[`tests/test_execution.py`](../tests/test_execution.py) import each entry point
+in a clean interpreter and fail if torch appears.
+
+One caveat worth stating: this makes torch a convenient *source* of CUDA
+libraries rather than a dependency. A deployment with the CUDA toolkit installed
+properly — or the container, which has it — never reaches this path. It exists
+so that a machine that only has CUDA inside a torch wheel still gets a GPU
+without importing torch to do it.
+
+Every results file records the *active* providers for exactly this reason, and
+the run header warns when a GPU is present but unused.
 
 **Frontend mismatch.** A mel frontend that differs from the one used at training
 degrades accuracy with nothing raised. This is why the ONNX frontend export
@@ -668,8 +701,8 @@ is a real option rather than a fallback. Usable concurrency is **1–2 streams p
 4 physical cores**, roughly 2 cores per stream.
 
 CPU-only is also where the torch-free runtime finally earns its keep: no CUDA,
-no torch, 68 MB instead of 425 MB — once `TODO.md` §1.3 is fixed, at which point
-nothing about the CUDA-DLL side effect matters any more either.
+no torch, 68 MB instead of 425 MB, and since §5.4 that applies to the service
+and not only to the package.
 
 ### 6.5 What transfers to other hardware — **estimates**
 
