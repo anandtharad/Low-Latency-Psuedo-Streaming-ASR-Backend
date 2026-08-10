@@ -518,6 +518,121 @@ The rewrite would remove a limit ~250× further away than the real one.
 
 ## 6. Measured results
 
+### 6.1 At a glance
+
+Every figure below is measured on this machine — GTX 1650 (4 GB) and a 4-core
+Tiger Lake CPU — with the real 507 MB Conformer-CTC checkpoint, a real 46 s
+recording built from Common Voice clips, greedy decoding, and audio paced at
+wall-clock speed. Regenerate all of it with
+[`scripts/benchmark_all.sh`](../scripts/benchmark_all.sh). Detail and method are
+in §6.2–6.8.
+
+#### The two metrics, and why they disagree
+
+**RTF** is compute ÷ audio duration; below 1.0 the machine keeps up with speech.
+**Response latency** is from the moment you stop speaking to text arriving.
+
+Queueing does not make RTF worse — each stream still computes at the same speed,
+it just waits its turn. So **RTF stays healthy while callers are stuck waiting**,
+and sizing on it produces a cluster that looks fine and feels broken.
+
+#### Concurrency, GPU
+
+| streams | RTF p50 | **response p50** | response p95 | GPU util | GPU mem | success |
+|---|---|---|---|---|---|---|
+| 1 | 0.427 | **727 ms** | 749 ms | 27 % | 1 690 MB | 100 % |
+| 2 | 0.501 | **756 ms** | 835 ms | 38 % | 2 826 MB | 100 % |
+| 4 | 0.719 | **1 178 ms** | 1 383 ms | 64 % | 2 970 MB | 100 % |
+| 8 | 0.883 | **3 396 ms** | 4 678 ms | 91 % | 4 023 MB | 100 % |
+| 12 | 1.188 | **14 151 ms** | 22 539 ms | 90 % | 3 979 MB | 100 % |
+| 16 | — | **service died** | — | 93 % | — | 0 % |
+
+Read row 12 across: RTF 1.19 reads as mild overload; callers waited 22 seconds.
+**Usable capacity is 4, not 12.** At 16 the process was killed by CUDA OOM —
+4 GB is genuinely full at 8 streams.
+
+#### Concurrency, CPU — and the threading default
+
+4 physical / 8 logical cores, `CPUExecutionProvider`. One setting, three
+configurations:
+
+| streams | ORT default (all cores) | pinned to 2 by hand | **derived automatically** |
+|---|---|---|---|
+| 1 | 1 329 ms | 1 577 ms | **1 241 ms** |
+| 2 | 1 567 ms | 1 803 ms | 1 683 ms |
+| 4 | **6 133 ms** | 3 412 ms | **2 596 ms** |
+
+ONNX Runtime gives every inference the whole machine, so four streams put ~16
+threads on 8 cores. Deriving the count from the admission cap cut four-stream
+latency 58 %. **Only that change is outside run-to-run noise** — the N=1
+differences are background load, not the setting (§6.4).
+
+#### Admission control turns an outage into a queue
+
+16 callers at once, cap 4: **4 served at 1 066 ms p50**, 12 refused immediately,
+**0 errors**, service up. The same burst uncapped is the row above that killed
+the process. One number's difference between graceful and outage.
+
+#### Cost does not grow with turn length
+
+`rtf_speech` divides compute by *speech*, excluding silence — the model's true
+cost:
+
+| bin | audio | speech | segments | **GPU** | CPU |
+|---|---|---|---|---|---|
+| 5 s | 3.4 s | 2.8 s | 1 | **0.438** | 0.674 |
+| 15 s | 10.3 s | 10.1 s | 1 | **0.360** | 0.763 |
+| 60 s | 57.7 s | 47.0 s | 10 | **0.342** | 0.898 |
+| 120 s | 105.9 s | 86.6 s | 17 | **0.385** | **1.008** |
+
+**Flat at 0.33 ± 0.04 from 3 seconds of audio to 106.** A two-minute monologue
+costs proportionally what a three-second reply does, because every forward pass
+is the same size regardless. That is the architectural argument, measured.
+
+The naive single pass over the same range *degrades* (WER 0.053 → 0.076) and
+then hard-fails past ~150 s (§2.3). CPU is not flat — it crosses 1.0 at 120 s,
+which looks like laptop thermal throttling and wants confirming on cooled
+hardware (§6.6).
+
+#### What the beam costs, and where
+
+No separate final decode exists: each segment is decoded authoritatively as it
+closes, so a beam is paid **on every pause**.
+
+| bin | segments | GPU greedy | GPU beam |
+|---|---|---|---|
+| 30 s | 5 | **59 ms** | 1 390 ms |
+| 120 s | 17 | **72 ms** | 1 522 ms |
+
+20–25× greedy, which would take one-caller response from 730 ms to ~2 s. Two
+caveats pointing opposite ways: that is beam search *in Python* (a reference
+backend, not production), and it is the **LM-free** half. flashlight + KenLM has
+never executed anywhere in this project (§7).
+
+#### Claims this evidence supports
+
+* Cost is **constant in turn length** where the naive approach degrades then
+  crashes.
+* Segmenting also **wins on accuracy** for real turns — 0.0505 against 0.0758 at
+  two minutes.
+* It **degrades gracefully**: under load it sheds partials (244 → 67 per stream)
+  while segment output stays exactly complete. Smoothness goes, words do not.
+* **Admission control** converts an outage into clean refusals.
+* **CPU is viable** — 4 laptop cores land within 2× of this GPU.
+
+#### Claims it does not
+
+* Capacity is **4 concurrent streams on this card**. The L4/A10G estimate
+  (~20–40) is extrapolation with a wide band (§6.5).
+* **The LM path is unmeasured**, and it is the one that would ship.
+* The CPU long-turn curve may be an artefact of this laptop's cooling.
+* The service still **dies rather than sheds** past its cap if the cap is set
+  wrong — an open defect (`TODO.md` §2.5.1), not a feature.
+
+---
+
+### 6.1.1 Accuracy, compute breakdown, one-caller latency
+
 **Accuracy** — real Conformer-CTC large, Common Voice English, greedy, no LM
 ([`tools/real_audio_wer.py`](../tools/real_audio_wer.py)):
 
@@ -609,7 +724,8 @@ the single most useful thing the load framework produced, and it is why
 
 **The knee is between 4 and 8.** Response latency roughly triples while RTF moves
 by a fifth. GPU utilisation over the same step goes 64 % → 91 %, so the device is
-the constraint — which also says the fix is batching (§8.1), not more processes.
+the constraint — which also says the fix is batching (`TODO.md` §3.1), not more
+processes.
 
 **Past the limit it does not degrade, it dies.** At 16 streams the service hit
 CUDA out-of-memory inside a device-to-host copy and the process went down,
@@ -749,7 +865,8 @@ occupancy a small-batch model gets on a large die:
 | 32-core server CPU | ~8–12 | *est.*, sublinear scaling, lower clocks, needs thread pinning |
 
 Two multipliers compound on top of any of these, and both matter more than the
-choice of card: **batching** streams into one inference call (§8.1, *est.*
+choice of card: **batching** streams into one inference call (`TODO.md` §3.1,
+*est.*
 3–4×) and **INT8** (*est.* 2–3× on x86 with VNNI, more with AMX).
 
 ### 6.6 Cost as a function of how long someone talks
