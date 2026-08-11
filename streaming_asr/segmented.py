@@ -26,6 +26,21 @@ single-pass final decode *repaired* the streaming duplication outright
 into fixed 10 s pieces it produced garbage. Short, pause-bounded, in-distribution
 spans are where this checkpoint is strong -- and its training capped utterances
 at 11 s, so segments are kept under that.
+
+Two frontends, one loop
+-----------------------
+The loop below is the only copy. It was two for a while: ``streaming_asr_lite``
+needed it without torch, and this module could not be imported without torch
+because it pulled the torchaudio preprocessor at module scope. That import now
+happens inside the branch that needs it, so the preprocessor is injectable and
+:class:`~streaming_asr_lite.pipeline.LiteSegmentedPipeline` subclasses this
+class instead of restating it.
+
+The two frontends were already interchangeable -- both take
+``(waveform, n_samples)`` and return ``(features, lengths)``. The two engines
+are not: torch features go to ``run_torch``, which binds device memory without
+a host round trip, and NumPy features go to ``run``. That call is therefore
+bound once at construction rather than branched on for every decode.
 """
 
 from __future__ import annotations
@@ -33,7 +48,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, Iterator, Optional
+from typing import Any, Callable, Iterable, Iterator, Optional
 
 import numpy as np
 
@@ -45,7 +60,11 @@ from streaming_asr.device import RuntimePlacement, resolve_device
 from streaming_asr.events import ASREvent, ASREventType
 from streaming_asr.inference.onnx_engine import ONNXASREngine
 from streaming_asr.metrics import MetricsCollector
-from streaming_asr.preprocessing.filterbank import Preprocessor
+
+# Every import above is torch-free at module scope, which is what lets the lite
+# runtime reuse this module. The torchaudio preprocessor is the one exception
+# and is imported inside __init__. Keep it that way: a torch import added here
+# silently re-splits the pipeline into two copies.
 
 logger = logging.getLogger(__name__)
 
@@ -106,38 +125,68 @@ class SegmentedASRPipeline:
             thresholds; everything else (model, device, decoders) is reused.
         engine / final_decoder: Pre-built and shared, as in the windowed
             pipeline, so a server loads them once.
+        preprocessor: Frontend producing ``(features, lengths)`` from
+            ``(waveform, n_samples)``. ``None`` builds the torchaudio one and
+            selects a device for it. Supplying one -- which the lite runtime
+            does -- means the caller owns placement, and the engine must be
+            supplied with it, because the two are chosen together.
     """
+
+    #: Reported in the metrics snapshot and the startup log, so which frontend
+    #: actually ran is visible without inspecting the object.
+    pipeline_name = "segmented"
 
     def __init__(
         self,
         config: StreamingASRConfig,
-        engine: Optional[ONNXASREngine] = None,
+        engine: Optional[Any] = None,
         final_decoder: Optional[FinalDecoder] = None,
+        preprocessor: Optional[Any] = None,
     ) -> None:
         self.config = config
         self.settings = config.segmentation
         self.vocabulary = config.ensure_blank_in_vocabulary()
 
-        self.placement: RuntimePlacement = resolve_device(config.device, config.providers)
-        if engine is None:
-            if not config.onnx_model_path:
-                raise ValueError("config.onnx_model_path is required when no engine is supplied")
-            engine = ONNXASREngine(
-                model_path=config.onnx_model_path,
-                providers=self.placement.providers,
-                intra_op_threads=config.intra_op_threads,
-                device_id=self.placement.device_id,
-            )
-        self.engine = engine
-        if self.placement.on_cuda and not engine.on_cuda:
-            self.placement = RuntimePlacement(
-                "cpu", engine.active_providers, self.placement.device_id,
-                "downgraded: CUDA provider failed to load",
-            )
+        if preprocessor is None:
+            # Imported here, not at module scope: this is the only torch
+            # dependency in the file, and hoisting it would make the shared
+            # loop unimportable for the lite runtime again.
+            from streaming_asr.preprocessing.filterbank import Preprocessor
 
-        self.preprocessor = Preprocessor(
-            config.preprocessing, device=self.placement.torch_device
-        )
+            self.placement: Optional[RuntimePlacement] = resolve_device(
+                config.device, config.providers
+            )
+            if engine is None:
+                if not config.onnx_model_path:
+                    raise ValueError("config.onnx_model_path is required when no engine is supplied")
+                engine = ONNXASREngine(
+                    model_path=config.onnx_model_path,
+                    providers=self.placement.providers,
+                    intra_op_threads=config.intra_op_threads,
+                    device_id=self.placement.device_id,
+                )
+            if self.placement.on_cuda and not engine.on_cuda:
+                self.placement = RuntimePlacement(
+                    "cpu", engine.active_providers, self.placement.device_id,
+                    "downgraded: CUDA provider failed to load",
+                )
+            self.preprocessor = Preprocessor(
+                config.preprocessing, device=self.placement.torch_device
+            )
+            # Features come out as torch tensors, so bind them straight to the
+            # session rather than copying device -> host -> device.
+            self._infer = engine.run_torch
+        else:
+            if engine is None:
+                raise ValueError(
+                    "an engine must be supplied alongside a preprocessor: the frontend "
+                    "and the session share a device, so they cannot be chosen separately"
+                )
+            self.placement = None
+            self.preprocessor = preprocessor
+            self._infer = engine.run
+
+        self.engine = engine
         self.greedy = GreedyCTCDecoder(
             vocabulary=self.vocabulary, blank_id=config.resolved_blank_id
         )
@@ -147,25 +196,43 @@ class SegmentedASRPipeline:
         )
 
         self.metrics = MetricsCollector()
-        self.metrics.on_gpu = self.placement.on_cuda or engine.on_cuda
-        self.metrics.gpu_device_id = self.placement.device_id
-        self.metrics.segment_silence = self.settings.segment_silence
-        self.metrics.config_summary = {
-            "pipeline": "segmented",
-            "segment_silence": self.settings.segment_silence,
-            "turn_silence": self.settings.turn_silence,
-            "max_segment_duration": self.settings.max_segment_duration,
-        }
+        self._describe_run()
 
         self._callbacks: list[EventCallback] = []
         self._reset_all()
 
         logger.info(
-            "Segmented pipeline ready: cut at %.2fs silence, turn ends at %.2fs, "
+            "%s pipeline ready: cut at %.2fs silence, turn ends at %.2fs, "
             "segments capped at %.1fs",
-            self.settings.segment_silence, self.settings.turn_silence,
-            self.settings.max_segment_duration,
+            self.pipeline_name, self.settings.segment_silence,
+            self.settings.turn_silence, self.settings.max_segment_duration,
         )
+        if config.final_beam_decode and config.beam.backend == "pure_python":
+            logger.warning(
+                "final_beam_decode is on with the pure-Python beam decoder. It is "
+                "O(frames x beam x tokens) in Python and measured 42x greedy (1924 ms "
+                "against 46 ms per segment) -- the loop stalls at every segment "
+                "boundary and a live microphone falls behind. Use --no-final-beam, or "
+                "a native backend (flashlight / pyctcdecode) once an LM exists."
+            )
+
+    def _describe_run(self) -> None:
+        """Stamp this run's identity onto a fresh metrics collector.
+
+        Called from ``__init__`` and again from :meth:`reset`, so that a reused
+        pipeline still reports the configuration it is running rather than an
+        empty summary.
+        """
+        on_cuda = bool(self.placement and self.placement.on_cuda)
+        self.metrics.on_gpu = on_cuda or self.engine.on_cuda
+        self.metrics.gpu_device_id = self.placement.device_id if self.placement else 0
+        self.metrics.segment_silence = self.settings.segment_silence
+        self.metrics.config_summary = {
+            "pipeline": self.pipeline_name,
+            "segment_silence": self.settings.segment_silence,
+            "turn_silence": self.settings.turn_silence,
+            "max_segment_duration": self.settings.max_segment_duration,
+        }
 
     # ---- state ----------------------------------------------------------
 
@@ -340,7 +407,7 @@ class SegmentedASRPipeline:
         features, lengths = self.preprocessor(audio.reshape(1, -1), n_samples=len(audio))
         preprocess_time = time.perf_counter() - pre_start
 
-        result = self.engine.run_torch(features, int(lengths[0]))
+        result = self._infer(features, int(lengths[0]))
         return result.logits, preprocess_time, result.inference_time
 
     def _emit_partial(self, chunk: AudioChunk) -> ASREvent:
@@ -553,8 +620,7 @@ class SegmentedASRPipeline:
     def reset(self) -> None:
         self._reset_all()
         self.metrics = MetricsCollector()
-        self.metrics.on_gpu = self.placement.on_cuda or self.engine.on_cuda
-        self.metrics.gpu_device_id = self.placement.device_id
+        self._describe_run()
 
 
 def _quietest_point(

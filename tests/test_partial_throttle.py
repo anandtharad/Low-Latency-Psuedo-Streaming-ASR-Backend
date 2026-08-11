@@ -101,17 +101,22 @@ def _logic(method) -> list[str]:
     return [ast.dump(node) for node in body]
 
 
-def test_both_pipelines_share_the_same_rule():
-    """The limiter is duplicated across the two pipelines; keep them aligned.
+def test_the_limiter_has_exactly_one_implementation():
+    """The rule was duplicated across the two pipelines; it is now inherited.
 
-    The duplication exists because ``segmented.py`` cannot be imported without
-    torch, so the lite pipeline could not reuse it. Recorded in docs/TODO.md.
+    The duplication existed because ``segmented.py`` could not be imported
+    without torch, so the lite pipeline restated the loop rather than reusing
+    it. It can now, and the lite pipeline subclasses it.
+
+    Asserting function *identity* rather than comparing two sources catches a
+    re-split at the moment it is introduced, instead of once the two copies
+    have already drifted.
     """
     from streaming_asr.segmented import SegmentedASRPipeline
     from streaming_asr_lite.pipeline import LiteSegmentedPipeline
 
-    assert _logic(SegmentedASRPipeline._partial_is_due) == \
-        _logic(LiteSegmentedPipeline._partial_is_due)
+    assert LiteSegmentedPipeline._partial_is_due is SegmentedASRPipeline._partial_is_due, \
+        "the lite pipeline has its own copy of the limiter again"
     assert _logic(_Throttle._partial_is_due) == \
         _logic(SegmentedASRPipeline._partial_is_due), \
         "this test's copy of the rule has drifted from the implementation"

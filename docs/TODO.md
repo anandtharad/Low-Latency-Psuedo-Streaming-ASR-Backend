@@ -212,11 +212,13 @@ degrades accuracy silently. Verified to **2.5e-04** on unit-variance features.
 
 Outstanding:
 
-* **The segmentation loop is duplicated** between `streaming_asr/segmented.py`
-  and `streaming_asr_lite/pipeline.py`, because the former imports torch via its
-  preprocessor and could not be reused without modification. A fix applied to
-  one must be applied to the other. Resolve by making the preprocessor
-  injectable in `segmented.py`, after which the two collapse into one.
+* ~~**The segmentation loop is duplicated**~~ — **DONE.** `segmented.py` now
+  takes an injectable preprocessor and imports the torchaudio one inside the
+  branch that needs it, so the module is importable without torch and
+  `LiteSegmentedPipeline` subclasses it instead of restating ~400 lines.
+  `tests/test_partial_throttle.py` asserts both names resolve to the *same
+  function object*, so a re-split fails the suite immediately rather than
+  drifting quietly.
 * Likewise `LiteONNXEngine` exists only because `ONNXASREngine.__init__` calls
   `_preload_cuda_runtime()`, which imports torch so ONNX Runtime can find CUDA
   DLLs from `torch/lib` on Windows. A torch-free runtime cannot rely on that and

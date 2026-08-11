@@ -976,10 +976,6 @@ and resumes produces no gap from the server's view, so the open segment never
 closes and pre/post-TTS speech merge. Not yet triggered because nothing pauses
 transmission; barge-in will trigger it immediately.
 
-**The segmentation loop is duplicated** between `segmented.py` and
-`streaming_asr_lite/pipeline.py`, because the former imports torch via its
-preprocessor. A fix applied to one must be applied to the other.
-
 **Compute grows with segment length.** Re-decoding the open segment on every
 partial is the price of never committing mid-utterance. A rate limiter bounds
 it, but on long pauseless speech it costs more than a fixed window would.
